@@ -47,7 +47,7 @@ model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accur
 
 print("Training LSTM model...")
 model.fit(X, y, epochs=10, batch_size=32, validation_split=0.2, verbose=1)
-print("✅ Training complete.")
+print("Training complete.")
 
 # === Step 4: Test with sample input ===
 sample_input = np.array([
