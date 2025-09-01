@@ -1,0 +1,13 @@
+# Core scientific libraries
+numpy
+pandas
+
+# Deep learning (for LSTM model)
+tensorflow
+
+# Reinforcement learning (for DRL model)
+gym
+stable-baselines3
+
+# Optional but useful (plotting results, debugging)
+matplotlib
