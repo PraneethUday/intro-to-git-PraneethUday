@@ -1,7 +1,9 @@
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.models import Sequential
+from tensorflow.keras import Sequential
 from tensorflow.keras.layers import LSTM, Dense
+
+print("All packages imported successfully")
 
 # === Step 1: Generate driving data ===
 def generate_driving_data(seq_length=10, num_samples=1000):
