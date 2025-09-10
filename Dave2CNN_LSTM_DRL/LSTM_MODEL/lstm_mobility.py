@@ -1,12 +1,13 @@
 # lstm_mobility.py
 """
-Improved LSTM mobility predictor.
+LSTM mobility predictor adapted to the provided dataset (dataset/traces.csv).
 
-Key improvements:
-- stacked LSTM + dropout
-- train callbacks: EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
-- optional delta-target mode (predict next-step change instead of absolute value)
-- saves best model in native Keras format (.keras)
+Key behavior:
+- Default CSV: dataset/traces.csv
+- Saves model + scaler to LSTM_MODEL/
+- Uses cumulative distance by default
+- Predicts delta by default (predict next-step change and add to last pos)
+- Default epochs = 20
 """
 
 import os
@@ -21,7 +22,7 @@ from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
 
-# ---------- Utilities ----------
+# --------- Utilities ----------
 def set_global_seed(seed):
     """Set random seeds for reproducibility (numpy, python, tf)."""
     if seed is None:
@@ -30,29 +31,55 @@ def set_global_seed(seed):
     random.seed(seed)
     tf.random.set_seed(seed)
 
-# ---------- Data loading ----------
-def load_traces_from_csv(csv_path, seq_len, min_len=None, time_col='time',
+# --------- Data loading ----------
+# ---------- Replace load_traces_from_csv with this improved version ----------
+def load_traces_from_csv(csv_path, seq_len, min_len=None, time_col='sim_time',
                          id_col='veh_id', x_col='x', y_col='y', use_cumulative=True,
-                         enforce_equal_length=True, trim_to=None):
+                         enforce_equal_length=True, trim_to=None, auto_relax=True):
     """
     Load mobility CSV and return traces dict {veh_id: np.array(positions)}.
-    By default returns cumulative distances per vehicle (use_cumulative=True).
+
+    Improvements:
+    - prints per-vehicle lengths (debugging)
+    - if auto_relax=True will try a relaxed min_len (seq_len + 5) and/or
+      disable enforce_equal_length if strict filtering leaves 0 traces.
     """
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"CSV file not found: {csv_path}")
 
     df = pd.read_csv(csv_path)
-    if min_len is None:
-        min_len = seq_len + 50
+    # validate/auto-detect columns (same as before)
+    cols = df.columns.tolist()
+    # fallback mapping
+    if time_col not in cols:
+        for c in ['time', 't', 'sim_time']:
+            if c in cols:
+                time_col = c; break
+    if id_col not in cols:
+        for c in ['veh_id', 'id', 'vehicle_id']:
+            if c in cols:
+                id_col = c; break
+    if x_col not in cols:
+        for c in ['x', 'pos_x', 'lon']:
+            if c in cols:
+                x_col = c; break
+    if y_col not in cols:
+        for c in ['y', 'pos_y', 'lat']:
+            if c in cols:
+                y_col = c; break
 
     required = [time_col, id_col, x_col, y_col]
     for c in required:
         if c not in df.columns:
-            raise ValueError(f"CSV missing required column: {c}")
+            raise ValueError(f"CSV missing required column: {c}. Available columns: {cols}")
+
+    if min_len is None:
+        min_len = seq_len + 50  # original conservative default
 
     df = df[[time_col, id_col, x_col, y_col]].dropna(subset=[time_col, id_col, x_col, y_col])
     df = df.sort_values([id_col, time_col])
 
+    per_vid_lengths = {}
     traces = {}
     for vid, g in df.groupby(id_col):
         g = g.sort_values(time_col)
@@ -63,13 +90,62 @@ def load_traces_from_csv(csv_path, seq_len, min_len=None, time_col='time',
             deltas = np.sqrt(np.diff(xs, prepend=xs[0])**2 + np.diff(ys, prepend=ys[0])**2)
             seq = np.cumsum(deltas)
         else:
-            seq = xs  # treat x coordinate as scalar feature
+            seq = xs
 
+        per_vid_lengths[str(vid)] = len(seq)
         if len(seq) >= min_len:
             traces[str(vid)] = seq.copy()
 
+    # DEBUG: print per-vehicle counts (brief)
+    print("Per-vehicle lengths (sample, first 10):")
+    sample_items = list(per_vid_lengths.items())[:10]
+    for k, v in sample_items:
+        print(f"  {k}: {v}")
+
+    if len(traces) == 0 and auto_relax:
+        # Try relaxing: reduce min_len to seq_len + 5 and/or allow variable lengths
+        relaxed_min = max(seq_len + 1, seq_len + 5)
+        print(f"No traces >= {min_len}. Trying relaxed min_len={relaxed_min} and enforce_equal_length=False.")
+        traces_relaxed = {}
+        for vid, g in df.groupby(id_col):
+            g = g.sort_values(time_col)
+            xs = g[x_col].values.astype(float)
+            ys = g[y_col].values.astype(float)
+            if use_cumulative:
+                deltas = np.sqrt(np.diff(xs, prepend=xs[0])**2 + np.diff(ys, prepend=ys[0])**2)
+                seq = np.cumsum(deltas)
+            else:
+                seq = xs
+            if len(seq) >= relaxed_min:
+                traces_relaxed[str(vid)] = seq.copy()
+        if len(traces_relaxed) > 0:
+            print(f"Found {len(traces_relaxed)} traces with relaxed_min={relaxed_min}. Proceeding with those (variable lengths).")
+            traces = traces_relaxed
+            enforce_equal_length = False
+        else:
+            # last resort: accept any trace of length >= seq_len+1
+            final_min = seq_len + 1
+            print(f"No traces for relaxed_min={relaxed_min}. Trying final_min={final_min}.")
+            traces_final = {}
+            for vid, g in df.groupby(id_col):
+                g = g.sort_values(time_col)
+                xs = g[x_col].values.astype(float)
+                ys = g[y_col].values.astype(float)
+                if use_cumulative:
+                    deltas = np.sqrt(np.diff(xs, prepend=xs[0])**2 + np.diff(ys, prepend=ys[0])**2)
+                    seq = np.cumsum(deltas)
+                else:
+                    seq = xs
+                if len(seq) >= final_min:
+                    traces_final[str(vid)] = seq.copy()
+            if len(traces_final) > 0:
+                print(f"Found {len(traces_final)} traces with final_min={final_min}. Proceeding with those.")
+                traces = traces_final
+                enforce_equal_length = False
+
     if len(traces) == 0:
-        raise ValueError("No vehicle trace long enough. Check CSV or reduce min_len.")
+        # nothing we can do
+        raise ValueError("No vehicle trace long enough. Check CSV or reduce seq_len/min_len manually.")
 
     if enforce_equal_length:
         if trim_to is None:
@@ -95,7 +171,6 @@ def build_dataset_from_traces(traces, seq_len, predict_delta=False):
             if next_idx >= n:
                 break
             if predict_delta:
-                # delta between next and last in seq
                 target = pos[next_idx] - pos[next_idx - 1]
             else:
                 target = pos[next_idx]
@@ -105,14 +180,14 @@ def build_dataset_from_traces(traces, seq_len, predict_delta=False):
         return np.empty((0, seq_len)), np.empty((0,))
     return np.array(X, dtype=float), np.array(y, dtype=float)
 
-# ---------- Model ----------
+# --------- Model ----------
 def make_lstm(seq_len, lstm_units=128, dropout=0.2):
     """Create a stacked LSTM model with dropout and a small dense head."""
     model = Sequential([
         Input(shape=(seq_len, 1)),
         LSTM(lstm_units, return_sequences=True),
         Dropout(dropout),
-        LSTM(lstm_units // 2),
+        LSTM(max(8, lstm_units // 2)),
         Dropout(dropout),
         Dense(64, activation='relu'),
         Dense(1)
@@ -120,28 +195,23 @@ def make_lstm(seq_len, lstm_units=128, dropout=0.2):
     model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3), loss='mse')
     return model
 
-# ---------- Train / save / load ----------
-# ---------- Train / save / load ----------
-def save_model_and_scaler(model, scaler,
-                          model_out_path="lstm_mobility_predictor.keras",
-                          scaler_out_path="scaler.pkl"):
-    """Save keras model and scaler tuple (scaler_X, scaler_y) in the same folder as this file."""
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    model_out_path = os.path.join(base_dir, os.path.basename(model_out_path))
-    scaler_out_path = os.path.join(base_dir, os.path.basename(scaler_out_path))
+# --------- Train / save / load ----------
+def save_model_and_scaler(model, scaler, out_dir="LSTM_MODEL",
+                          model_out_name="lstm_mobility_predictor.keras",
+                          scaler_out_name="scaler.pkl"):
+    """Save keras model and scaler tuple (scaler_X, scaler_y) inside out_dir."""
+    os.makedirs(out_dir, exist_ok=True)
+    model_out_path = os.path.join(out_dir, model_out_name)
+    scaler_out_path = os.path.join(out_dir, scaler_out_name)
 
     model.save(model_out_path)
     joblib.dump(scaler, scaler_out_path)
     print(f"✅ Model saved to {model_out_path}")
     print(f"✅ Scaler saved to {scaler_out_path}")
 
-def load_model_and_scaler(model_path="lstm_mobility_predictor.keras",
-                          scaler_path="scaler.pkl"):
-    """Load model and scaler from the same folder as this file."""
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    model_path = os.path.join(base_dir, os.path.basename(model_path))
-    scaler_path = os.path.join(base_dir, os.path.basename(scaler_path))
-
+def load_model_and_scaler(model_path="LSTM_MODEL/lstm_mobility_predictor.keras",
+                          scaler_path="LSTM_MODEL/scaler.pkl"):
+    """Load model and scaler from LSTM_MODEL folder."""
     if not os.path.exists(model_path):
         alt = model_path.replace(".keras", ".h5")
         if os.path.exists(alt):
@@ -155,11 +225,10 @@ def load_model_and_scaler(model_path="lstm_mobility_predictor.keras",
     scaler = joblib.load(scaler_path)
     return model, scaler
 
-
 def train_lstm(traces, seq_len=8, epochs=20, batch_size=128, validation_split=0.1,
-               model_out_path="lstm_mobility_predictor.keras", scaler_out_path="scaler.pkl",
-               lstm_units=128, dropout=0.2, predict_delta=False, seed=42, verbose=1,
-               patience=6):
+               out_dir="LSTM_MODEL", model_out_name="lstm_mobility_predictor.keras",
+               scaler_out_name="scaler.pkl", lstm_units=128, dropout=0.2,
+               predict_delta=False, seed=42, verbose=1, patience=6):
     """
     Trains LSTM with callbacks and optional delta targets.
     Returns: model, scalers_tuple (scaler_X, scaler_y), history, X_test, y_test, mse_scaled
@@ -190,7 +259,7 @@ def train_lstm(traces, seq_len=8, epochs=20, batch_size=128, validation_split=0.
     model = make_lstm(seq_len, lstm_units=lstm_units, dropout=dropout)
 
     # Callbacks: early stop + reduce LR + checkpoint
-    ckpt_path = model_out_path + ".best.keras"
+    ckpt_path = os.path.join(out_dir, model_out_name + ".best.keras")
     callbacks = [
         EarlyStopping(monitor="val_loss", patience=patience, restore_best_weights=True, verbose=0),
         ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=max(2, patience//3), verbose=0, min_lr=1e-6),
@@ -210,11 +279,12 @@ def train_lstm(traces, seq_len=8, epochs=20, batch_size=128, validation_split=0.
     mse_scaled = float(mean_squared_error(y_test, pred_test)) if len(X_test) > 0 else float('nan')
 
     # Save model and both scalers together as a tuple
-    save_model_and_scaler(model, (scaler_X, scaler_y), model_out_path=model_out_path, scaler_out_path=scaler_out_path)
+    save_model_and_scaler(model, (scaler_X, scaler_y), out_dir=out_dir,
+                          model_out_name=model_out_name, scaler_out_name=scaler_out_name)
 
     return model, (scaler_X, scaler_y), history, X_test, y_test, mse_scaled
 
-# ---------- Prediction ----------
+# --------- Prediction ----------
 def predict_next_pos(raw_seq, model, scalers, seq_len, predict_delta=False):
     """
     raw_seq: array-like length >= seq_len (if longer, last seq_len used)
@@ -239,28 +309,51 @@ def predict_next_pos(raw_seq, model, scalers, seq_len, predict_delta=False):
     else:
         return float(p_unscaled)
 
-# ---------- Small CLI for quick run ----------
+# --------- Small CLI for quick run ----------
+# --------- Small CLI for quick run ----------
 if __name__ == "__main__":
-    CSV_PATH = "mobility_traces.csv"
-    SEQ_LEN = 8
+    # now expects traces.csv in the same directory as this script
+    CSV_PATH = "traces.csv"
+    SEQ_LEN = 8      # lower if traces are short (e.g., 4)
+    EPOCHS = 20
+    PREDICT_DELTA = True
+    USE_CUMULATIVE = True
+    BATCH_SIZE = 128
+    OUT_DIR = "LSTM_MODEL"
 
     if not os.path.exists(CSV_PATH):
-        print(f"CSV not found at {CSV_PATH}. Put your SUMO CSV in place and re-run.")
+        print(f"CSV not found at {CSV_PATH}. Put traces.csv in same folder and re-run.")
     else:
         print("Loading traces...")
-        traces = load_traces_from_csv(CSV_PATH, seq_len=SEQ_LEN, use_cumulative=True)
-        print(f"Loaded {len(traces)} traces. Training improved LSTM (predict_delta=True recommended)...")
+        # pass a small min_len or let auto_relax handle it
+        traces = load_traces_from_csv(
+            CSV_PATH,
+            seq_len=SEQ_LEN,
+            use_cumulative=USE_CUMULATIVE,
+            enforce_equal_length=True,   # we allow loader to relax if necessary
+            auto_relax=True
+        )
+        n_traces = len(traces)
+        print(f"Loaded {n_traces} vehicle traces. Example IDs: {list(traces.keys())[:5]}")
+        # Quick dataset check
+        X_raw, y_raw = build_dataset_from_traces(traces, SEQ_LEN, predict_delta=PREDICT_DELTA)
+        print(f"Generated {len(X_raw)} training samples from traces.")
+        if len(X_raw) < 10:
+            print("Warning: Very few training samples (<10). Consider reducing SEQ_LEN or collecting longer traces.")
+        # Train
+        print(f"Training improved LSTM (predict_delta={PREDICT_DELTA}) for {EPOCHS} epochs...")
         model, scalers, history, X_test, y_test, mse = train_lstm(
             traces,
             seq_len=SEQ_LEN,
-            epochs=20,                 # <-- changed to 20
-            batch_size=128,
+            epochs=EPOCHS,
+            batch_size=BATCH_SIZE,
             validation_split=0.1,
-            model_out_path="lstm_mobility_predictor.keras",
-            scaler_out_path="scaler.pkl",
+            out_dir=OUT_DIR,
+            model_out_name="lstm_mobility_predictor.keras",
+            scaler_out_name="scaler.pkl",
             lstm_units=128,
             dropout=0.2,
-            predict_delta=True,
+            predict_delta=PREDICT_DELTA,
             seed=42,
             verbose=1,
             patience=6
@@ -268,6 +361,6 @@ if __name__ == "__main__":
         print("Scaled MSE on test:", mse)
         vid = list(traces.keys())[0]
         seq = traces[vid][:SEQ_LEN]
-        pred = predict_next_pos(seq, model, scalers, SEQ_LEN, predict_delta=True)
-        print("Example sequence:", seq)
+        pred = predict_next_pos(seq, model, scalers, SEQ_LEN, predict_delta=PREDICT_DELTA)
+        print("Example sequence (first vehicle first SEQ_LEN values):", seq)
         print("Predicted next (absolute):", pred)
